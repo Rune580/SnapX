@@ -18,4 +18,8 @@
     <ProjectReference Include="..\SnapX.Core\SnapX.Core.csproj" />
     <ProjectReference Include="..\SnapX.CommonUI\SnapX.CommonUI.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="/home/rune/RiderProjects/PipeWireSharp/PipeWireSharp/bin/Debug/net9.0/PipeWireSharp.dll" />
+  </ItemGroup>
 </Project>

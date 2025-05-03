@@ -1,29 +1,49 @@
+using System.Collections.Concurrent;
+using FFMpegCore;
+using FFMpegCore.Enums;
+using FFMpegCore.Pipes;
+using PipeWireSharp;
+using PipeWireSharp.PipeWire;
+using PipeWireSharp.PipeWire.Streams;
+using PipeWireSharp.Spa;
+using PipeWireSharp.Spa.Enums;
+using PipeWireSharp.Spa.Pods;
+using PipeWireSharp.Spa.Pods.Object;
+using PipeWireSharp.Spa.Utils;
 using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using SnapX.Core.SharpCapture.Linux.DBus;
 using Tmds.DBus;
 using Tmds.DBus.Protocol;
+using Stream = PipeWireSharp.PipeWire.Streams.Stream;
 
 namespace SnapX.Core.SharpCapture.Linux;
 
 public class LinuxCapture : BaseCapture
 {
+    private FormatPodObject? formatObject;
+
     public override async Task<Image?> CaptureFullscreen()
     {
         // if (LinuxAPI.IsWayland()) return await TakeScreenshotWithPortal();
 
-        if (!IsCompositorKwin) return await TakeScreenshotWithPortal();
+        await StartRecording();
+
+        // if (!IsCompositorKwin) return await TakeScreenshotWithPortal();
         // Todo: replace try catch with method that checks for valid kwin permissions.
         try
         {
-            return await TakeScreenshotWithKwin();
+            // return await TakeScreenshotWithKwin();
         }
         catch (Exception e)
         {
             // Fallback to portal method.
         }
 
-        return await TakeScreenshotWithPortal();
+        // return await TakeScreenshotWithPortal();
+
+        throw new NotImplementedException();
     }
 
     private static async Task<Image> TakeScreenshotWithPortal()
@@ -138,5 +158,245 @@ public class LinuxCapture : BaseCapture
         // return LinuxAPI.TakeScreenshotWithX11(screen);
     }
 
+    private ConcurrentQueue<PipeWireFrame> _frameBuffer = new();
+    private int _framesRemaining = 480;
+
+    public async Task StartRecording()
+    {
+        var connection = new Connection(Address.Session!);
+        await connection.ConnectAsync().ConfigureAwait(false);
+        var desktop = new DesktopService(connection, "org.freedesktop.portal.Desktop");
+
+        var screencast = desktop.CreateScreenCast("/org/freedesktop/portal/desktop");
+
+        var handleToken = NewHandleToken();
+        var sessionHandleToken = NewHandleToken();
+
+        var createSessionOptions = new Dictionary<string, VariantValue>
+        {
+            { "handle_token", handleToken },
+            { "session_handle_token", sessionHandleToken }
+        };
+        var response = await connection.Call(() => screencast.CreateSessionAsync(createSessionOptions));
+
+        if (!response.Results.TryGetValue("session_handle", out var sessionHandle))
+        {
+            throw new Exception("Failed to create ScreenCast session");
+        }
+
+        var session = new Session(desktop, sessionHandle.GetString());
+        PipeWireSharpLib.Init();
+
+        var mainLoop = new MainLoop();
+
+        try
+        {
+            // Possible values: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html#org-freedesktop-portal-screencast-selectsources
+            var selectSourcesOptions = new Dictionary<string, VariantValue>
+            {
+                { "handle_token", NewHandleToken() },
+                { "types", (uint)(1 | 2 | 4) },
+                { "multiple", false },
+                { "cursor_mode", (uint)2 },
+            };
+            await screencast.SelectSourcesAsync(session.Path, selectSourcesOptions);
+
+            var startOptions = new Dictionary<string, VariantValue>
+            {
+                { "handle_token", NewHandleToken() }
+            };
+            // TODO: Set `parentWindow`
+            var streams = await connection.Call(() => screencast.StartAsync(session.Path, "", startOptions));
+
+            var pipewireRemoteOptions = new Dictionary<string, VariantValue>();
+            var pipewireRemote = await screencast.OpenPipeWireRemoteAsync(session.Path, pipewireRemoteOptions);
+
+            if (pipewireRemote is null)
+                throw new InvalidOperationException("Failed to open PipeWire remote!");
+
+            var streamData = streams.Results["streams"].GetArray<VariantValue>();
+            var nodeId = streamData[0].GetItem(0).GetUInt32();
+
+            var context = new Context(mainLoop);
+            var core = context.ConnectFd(pipewireRemote);
+
+            var streamProperties = new PwProperties();
+
+            streamProperties.Insert(PwPropertyKey.MEDIA_TYPE, "Video");
+            streamProperties.Insert(PwPropertyKey.MEDIA_CATEGORY, "Capture");
+            streamProperties.Insert(PwPropertyKey.MEDIA_ROLE, "Screen");
+
+            var stream = new Stream(core, "snapx-capture-stream", streamProperties);
+
+            var builder = stream.AddListener()
+                .OnStateChanged(StateChangedEvent)
+                .OnParamChanged(ParamChangedEvent)
+                .OnProcess(ProcessEvent);
+
+            var listener = builder.Register();
+
+            var videoParams = new VideoParameters
+            {
+                Formats = { SpaVideoFormat.Rgb, SpaVideoFormat.Rgba, SpaVideoFormat.Bgr, SpaVideoFormat.Bgra },
+                PreferredSize = new SpaRectangle
+                {
+                    Width = 2560,
+                    Height = 1440
+                },
+                MinSize = new SpaRectangle
+                {
+                    Width = 1,
+                    Height = 1
+                },
+                MaxSize = new SpaRectangle
+                {
+                    Width = 10240,
+                    Height = 5760
+                },
+                PreferredFrameRate = new SpaFraction
+                {
+                    Numerator = 30,
+                    Denominator = 1
+                },
+                MinFrameRate = new SpaFraction
+                {
+                    Numerator = 0,
+                    Denominator = 1
+                },
+                MaxFrameRate = new SpaFraction
+                {
+                    Numerator = 480,
+                    Denominator = 1
+                }
+            };
+
+            stream.Connect(Direction.Input, nodeId, StreamFlags.AutoConnect | StreamFlags.MapBuffers, videoParams);
+
+            ThreadPool.QueueUserWorkItem(CreateVideo);
+
+            mainLoop.Run();
+        }
+        finally
+        {
+            await session.CloseAsync();
+        }
+    }
+
+    private void StateChangedEvent(Stream streamRef, StreamState oldState, StreamState newState, string msg)
+    {
+        Console.WriteLine($"State Changed: {oldState} -> {newState}");
+        if (!string.IsNullOrEmpty(msg))
+            Console.WriteLine($"Got Error: {msg}");
+    }
+
+    void ParamChangedEvent(Stream streamRef, uint id, PodValue param)
+    {
+        Console.WriteLine("Param Changed!");
+        Console.WriteLine(param.ToString());
+
+        if (id == (uint)SpaParamType.Format)
+        {
+            formatObject = param;
+
+            streamRef.UpdateParams(new StreamParameters());
+        }
+    }
+
+    private void ProcessEvent(Stream stream)
+    {
+        if (_framesRemaining <= 0)
+            return;
+
+        var pwBuffer = stream.DequeueBuffer();
+
+        if (formatObject is null)
+        {
+            Console.WriteLine("uhhh no?");
+            return;
+        }
+
+        var size = formatObject.VideoSize!.Value;
+
+        foreach (var bufferData in pwBuffer.Buffer.Data)
+        {
+            var frameData = bufferData.GetFrameData();
+
+            _frameBuffer.Enqueue(new PipeWireFrame(frameData, (int)size.Width, (int)size.Height));
+            _framesRemaining--;
+
+            if (_framesRemaining <= 0)
+            {
+                break;
+            }
+        }
+
+        stream.QueueBuffer(pwBuffer);
+    }
+
+    private IEnumerable<IVideoFrame> GetFrames()
+    {
+        while (_frameBuffer.TryDequeue(out var frame))
+        {
+            yield return frame;
+        }
+    }
+
+    private void CreateVideo(object? State)
+    {
+        while (_framesRemaining > 0)
+        {
+            Thread.Sleep(100);
+        }
+
+        var videosSource = new RawVideoPipeSource(GetFrames())
+        {
+            FrameRate = 60,
+        };
+
+        FFMpegArguments
+            .FromPipeInput(videosSource)
+            .OutputToFile("/home/rune/Desktop/test_video.mp4", true, options =>
+            {
+                options.WithVideoCodec(VideoCodec.LibX264);
+            })
+            .ProcessSynchronously(ffMpegOptions: new FFOptions()
+            {
+                LogLevel = FFMpegLogLevel.Debug
+            });
+    }
+
+    private static string NewHandleToken()
+    {
+        var guid = Guid.NewGuid().ToString();
+        return $"snapx_{guid.Replace("-", "")}";
+    }
+
     private static bool IsCompositorKwin => Environment.GetEnvironmentVariable("XDG_SESSION_TYPE") == "wayland" && Environment.GetEnvironmentVariable("XDG_CURRENT_DESKTOP") == "KDE";
+
+    private class PipeWireFrame : IVideoFrame
+    {
+        private readonly byte[] _data;
+
+        public PipeWireFrame(byte[] data, int width, int height)
+        {
+            _data = data;
+            Width = width;
+            Height = height;
+        }
+
+        public void Serialize(System.IO.Stream pipe)
+        {
+            pipe.Write(_data);
+        }
+
+        public Task SerializeAsync(System.IO.Stream pipe, CancellationToken token)
+        {
+            var task = pipe.WriteAsync(_data, token);
+            return task.AsTask();
+        }
+
+        public int Width { get; set; }
+        public int Height { get; set; }
+        public string Format => "bgra";
+    }
 }
